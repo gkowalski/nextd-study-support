@@ -443,6 +443,7 @@ create table nextd_med_info (
   rxcui integer,
   pattern varchar2(128),
   but_not varchar2(128),
+  note varchar2(256),
   constraint dm_drug_bool check (dm_drug in (0, 1)),
   constraint code_or_pattern check (
     (choose_by = 'RXNORM' and rxcui is not null and pattern is null) or
