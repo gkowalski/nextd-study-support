@@ -18,6 +18,7 @@
 
 Create them using extraction_tmp_ddl.sql and
 import from med_info.csv, lab_review.csv respectively.
+
 */
 select case when labs > 0 and meds > 0 then 1
        else 1 / 0 end curated_data_loaded from (
@@ -26,7 +27,6 @@ select case when labs > 0 and meds > 0 then 1
     (select count(*) from nextd_lab_review) labs
   from dual
 );
-
 create or replace view encounter_of_interest as
 with age_at_visit as (
   select cast(d.BIRTH_DATE as date) BIRTH_DATE
@@ -363,6 +363,7 @@ select uf.PATID, uf.LAB_ORDER_DATE,row_number() over (partition by un.PATID orde
   on un.PATID = uf.PATID
   where abs(un.LAB_ORDER_DATE-uf.LAB_ORDER_DATE)>1 
   and abs(cast(((cast(un.LAB_ORDER_DATE as date)-cast(uf.LAB_ORDER_DATE as date))/365.25 ) as integer))<=2;
+--- ERROR HERE 
 insert into FG_final_FirstPair             
 select x.PATID, x.LAB_ORDER_DATE as EventDate 
   from temp2 x where x.rn=1; 
