@@ -18,6 +18,7 @@
 
 Create them using extraction_tmp_ddl.sql and
 import from med_info.csv, lab_review.csv respectively.
+
 */
 select case when labs > 0 and meds > 0 then 1
        else 1 / 0 end curated_data_loaded from (
@@ -26,7 +27,6 @@ select case when labs > 0 and meds > 0 then 1
     (select count(*) from nextd_lab_review) labs
   from dual
 );
-
 create or replace view encounter_of_interest as
 with age_at_visit as (
   select cast(d.BIRTH_DATE as date) BIRTH_DATE
@@ -96,10 +96,139 @@ select e.ENCOUNTERID, e.patid, e.BIRTH_DATE, e.admit_date, e.enc_type
   where e.ENC_TYPE in ('IP', 'EI', 'AV', 'ED') 
   and e.age between 18 and 89
 ;
+/*-------------------------------------------------------------------------------------------------------------
+---------------------------------------------------------------------------------------------------------------
+-----                                    Part 2: Defining Pregnancy                                       ----- 
+---------------------------------------------------------------------------------------------------------------
+---------------------------------------------------------------------------------------------------------------
+-----                             People with pregnancy-related encounters                                -----
+-----                                                                                                     -----            
+-----                       Encounter should meet the following requirements:                             -----
+-----           Patient must be 18 years old >= age <= 89 years old during the encounter day.             -----
+-----                                                                                                     -----
+-----                 The date of the first encounter for each pregnancy is collected.                    -----
+---------------------------------------------------------------------------------------------------------------
+ Cases with miscarriage or abortion diagnosis codes:*/
 
+insert into Miscarr_Abort
+select ds.PATID, dia.ADMIT_DATE 
+  from DenominatorSummary ds
+  join "&&PCORNET_CDM".DIAGNOSIS dia 
+  on ds.PATID=dia.PATID
+	join "&&PCORNET_CDM".ENCOUNTER e
+	on dia.ENCOUNTERID=e.ENCOUNTERID 
+	join "&&PCORNET_CDM".DEMOGRAPHIC d
+	on e.PATID=d.PATID
+		where ((regexp_like(dia.DX,'63[0|1|2|3|4|5|6|7|8|9]\..') and dia.DX_TYPE = '09') or (regexp_like(dia.DX, '^O') and dia.DX_TYPE = '10'))
+		and cast(((cast(dia.ADMIT_DATE as date)-cast(d.BIRTH_DATE as date))/365.25 ) as integer) <= 89 
+    and cast(((cast(dia.ADMIT_DATE as date)-cast(d.BIRTH_DATE as date))/365.25 ) as integer) >=18;
+COMMIT;
+/*-- Cases with pregnancy and birth diagnosis codes:*/
+insert into Pregn_Birth
+select ds.PATID,dia.ADMIT_DATE 
+  from DenominatorSummary ds
+  join "&&PCORNET_CDM".DIAGNOSIS dia 
+  on ds.PATID=dia.PATID
+	join "&&PCORNET_CDM".ENCOUNTER e
+	on dia.ENCOUNTERID=e.ENCOUNTERID 
+	join "&&PCORNET_CDM".DEMOGRAPHIC d
+	on e.PATID=d.PATID	
+	where (regexp_like(dia.DX,'6[4|5|6|7][0|1|2|3|4|5|6|7|8|9]\..') and dia.DX_TYPE = '09')
+  and cast(((cast(dia.ADMIT_DATE as date)-cast(d.BIRTH_DATE as date))/365.25 ) as integer) <= 89 
+  and cast(((cast(dia.ADMIT_DATE as date)-cast(d.BIRTH_DATE as date))/365.25 ) as integer) >=18;
+COMMIT;
+/* Cases with delivery procedures in ICD-9 coding:*/
+insert into DelivProc
+select ds.PATID, p.ADMIT_DATE 
+  from DenominatorSummary ds
+  join "&&PCORNET_CDM".PROCEDURES p 
+  on ds.PATID=p.PATID
+	join "&&PCORNET_CDM".ENCOUNTER e
+	on p.ENCOUNTERID=e.ENCOUNTERID 
+	join "&&PCORNET_CDM".DEMOGRAPHIC d
+	on e.PATID=d.PATID	
+		where ((regexp_like(p.PX,'7[2|3|4|5]\..') and p.PX_TYPE = '09') or (p.PX like '^1' and p.PX_TYPE = '10'))
+		and cast(((cast(p.ADMIT_DATE as date)-cast(d.BIRTH_DATE as date))/365.25 ) as integer) <= 89 
+    and cast(((cast(p.ADMIT_DATE as date)-cast(d.BIRTH_DATE as date))/365.25 ) as integer)>=18;
+COMMIT;
+/* Cases with delivery procedures in CPT coding:		*/
+insert into PregProc
+select ds.PATID, p.ADMIT_DATE 
+  from DenominatorSummary ds
+  join "&&PCORNET_CDM".PROCEDURES p 
+  on ds.PATID=p.PATID
+	join "&&PCORNET_CDM".ENCOUNTER e
+	on p.ENCOUNTERID=e.ENCOUNTERID 
+	join "&&PCORNET_CDM".DEMOGRAPHIC d
+	on e.PATID=d.PATID	
+	where (regexp_like(p.PX,'59[0|1|2|3|4|5|6|7|8|9][0|1|2|3|4|5|6|7|8|9][0|1|2|3|4|5|6|7|8|9]') and p.PX_TYPE in ('C3', 'C4', 'CH'))
+    /* Changed to include C4 (and CH for later updates) since it refers to the same thing as C3 according to the CDM 3.1 Specification */
+	and cast(((cast(p.ADMIT_DATE as date)-cast(d.BIRTH_DATE as date))/365.25 ) as integer) <= 89 
+  and cast(((cast(p.ADMIT_DATE as date)-cast(d.BIRTH_DATE as date))/365.25 ) as integer) >=18;
+COMMIT;
+/*---------------------------------------------------------------------------------------------------------------
+ Collect all encounters related to pregnancy:  */
+insert into AllPregnancyWithAllDates
+select x.PATID,x.ADMIT_DATE 
+  from
+  (select a.PATID, a.ADMIT_DATE 
+  from Miscarr_Abort a
+  union
+  select b.PATID, b.ADMIT_DATE
+  from Pregn_Birth b
+  union
+  select c.PATID, c.ADMIT_DATE
+  from DelivProc c
+  union
+  select d.PATID, d.ADMIT_DATE
+  from PregProc d)x
+  group by x.PATID, x.ADMIT_DATE;
+COMMIT;
+/*---------------------------------------------------------------------------------------------------------------
+-- Find separate pregnancy events:                                   
+-- Calculate time difference between each pregnancy encounter, select the first encounter of each pregnancy event:  */
+insert into DeltasPregnancy
+select x2.PATID,x2.ADMIT_DATE,x2.dif 
+  from
+  (select x.PATID, x.ADMIT_DATE, round(months_between(x.ADMIT_DATE, Lag(x.ADMIT_DATE, 1,NULL) OVER(partition by x.PATID ORDER BY x.ADMIT_DATE))) as dif
+  from AllPregnancyWithAllDates x)x2
+  where x2.dif is NULL or x2.dif>=12;
+COMMIT;
+/* Number pregnancies:  */
+insert into NumberPregnancy
+select x.PATID, x.ADMIT_DATE, row_number() over (partition by x.PATID order by x.ADMIT_DATE asc) rn 
+  from DeltasPregnancy x;
+COMMIT;
+/* Transponse pregnancy table into single row per patient. Currently allows 21 sepearate pregnacy events:  */
+insert into FinalPregnancy
+select * 
+  from
+  (select PATID, ADMIT_DATE, rn
+  from NumberPregnancy) 
+  pivot (max(ADMIT_DATE) for (rn) in (1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21)
+  ) order by PATID;     
+COMMIT;
+
+--Exclude pregnancy encounters from the encounters of interest and create a new view from the remaining encounters
+create or replace view encounter_exclude_pregnancy as 
+(
+select * from encounter_of_interest
+where encounterid not in
+    (
+    --Find encounters that fall within one year of pregnancy admit dates
+    select /*distinct*/ eoi.encounterid 
+    --eoi.birth_date, eoi.enc_type, eoi.patid, np.patid, 
+    --eoi.admit_date, np.admit_date, (eoi.admit_date - np.admit_date) as date_diff
+    from encounter_of_interest eoi
+    join NumberPregnancy np
+    on eoi.patid = np.patid
+    where abs(eoi.admit_date - np.admit_date) <= 365
+    )
+);
+COMMIT;
 
 /*-------------------------------------------------------------------------------------------------------------
-                         Part 2: Defining Diabetes Mellitus sample                                   
+                         Part 3: Defining Diabetes Mellitus sample                                   
 ---------------------------------------------------------------------------------------------------------------
 ---------------------------------------------------------------------------------------------------------------
 -----        People with HbA1c having two measures on different days within 2 years interval              -----
@@ -116,14 +245,15 @@ select e.ENCOUNTERID, e.patid, e.BIRTH_DATE, e.admit_date, e.enc_type
 ---------------------------------------------------------------------------------------------------------------
              Get all labs for each patient sorted by date:           */
 insert into A1c_initial
-select ds.PATID, l.LAB_ORDER_DATE, row_number() over (partition by l.PATID order by l.LAB_ORDER_DATE asc) rn 
-  from DenominatorSummary ds
-  join "&&PCORNET_CDM".LAB_RESULT_CM l 
-  on ds.PATID=l.PATID
-  join encounter_of_interest e
+select e.PATID, l.LAB_ORDER_DATE, row_number() over (partition by l.PATID order by l.LAB_ORDER_DATE asc) rn 
+  from "&&PCORNET_CDM".LAB_RESULT_CM l 
+  join encounter_exclude_pregnancy e
   on l.ENCOUNTERID=e.ENCOUNTERID 
   where l.LAB_NAME='A1C'  
   and l.RESULT_NUM >=6.5 and l.RESULT_UNIT='PERCENT'
+  and e.ENC_TYPE in ('IP', 'EI', 'AV', 'ED')
+  and (round(l.LAB_ORDER_DATE) - e.BIRTH_DATE)/365 <= 89
+  and (round(l.LAB_ORDER_DATE) - e.BIRTH_DATE)/365 >= 18
   ;
 COMMIT;
 /*    The first date out the first pair of encounters is selected:      */
@@ -171,47 +301,59 @@ order by l.lab_name, l.result_unit
 */
  
 create or replace view glucose_concepts as
-with loinc_concepts as (
-  select concept_path, name_char, concept_cd, substr(concept_cd, length('LOINC:_')) lab_loinc
+with lab_concepts as (
+  select concept_path, name_char, concept_cd
   from "&&I2B2_STAR".concept_dimension cd
   where concept_path like '\i2b2\Laboratory Tests\%'
-  and concept_cd like 'LOINC:%'
 )
 , loinc_fasting_glucose as (
-  select 1 fasting, l.* from loinc_concepts l
-  where l.concept_cd in ( select c_basecode from nextd_lab_review where category = 'Fasting Glucose') 
+  select 1 fasting, lr.loinc lab_loinc, l.* from lab_concepts l
+  join nextd_lab_review lr on l.concept_cd = 'LOINC:' || lr.loinc
+  where lr.label = 'Fasting Glucose'
 )
 , loinc_random_glucose as (
-  select 0 fasting, l.* from loinc_concepts l
-  where l.concept_cd in ( select c_basecode from nextd_lab_review where category = 'Random Glucose')
+  select 0 fasting, lr.loinc lab_loinc, l.* from lab_concepts l
+  join nextd_lab_review lr on l.concept_cd = 'LOINC:' || lr.loinc
+  where lr.label = 'Random Glucose'
 )
-select fasting, lrg.lab_loinc, cd.name_char, cd.concept_cd, cd.concept_path
-from loinc_random_glucose lrg
-join "&&I2B2_STAR".concept_dimension cd
-  on cd.concept_path like (lrg.concept_path || '%')
+select fasting, 'GLUF' lab_name, lg.lab_loinc, cd.name_char, cd.concept_cd, cd.concept_path
+from (
+  select * from loinc_fasting_glucose
+  union all
+  select * from loinc_random_glucose
+  ) lg
+join lab_concepts cd
+  on cd.concept_path like (lg.concept_path || '%')
 ;
 
-
-create or replace view glucose_results as
-select obs.patient_num, obs.start_date, obs.encounter_num
-     , obs.nval_num, obs.units_cd, obs.concept_cd
-     , gc.name_char, gc.fasting
+--drop table lab_result_cm_i2b2;
+create table lab_result_cm_i2b2 as
+select obs.patient_num as patid, obs.start_date LAB_ORDER_DATE
+     , obs.encounter_num encounterid
+     , obs.nval_num RESULT_NUM, obs.units_cd RESULT_UNIT
+     , obs.concept_cd raw_facility_code
+     , gc.LAB_LOINC
+     , gc.lab_name, gc.fasting
 from
   glucose_concepts gc
 join "&&I2B2_STAR".observation_fact obs on obs.concept_cd = gc.concept_cd
 ;
+--select * from lab_result_cm_i2b2;
+--select * from "&&PCORNET_CDM".lab_result_cm;
 
 insert into FG_initial
--- LAB_ORDER_DATE became start_date, which is more likely result date-time than order date.
-select ds.PATID, l.start_date, row_number() over (partition by l.patient_num order by l.start_date asc) rn  
-  from DenominatorSummary ds
-  join glucose_results l 
-  on ds.PATID=l.patient_num
-  join encounter_of_interest e
-  on l.encounter_num=e.ENCOUNTERID
-  where l.fasting = 1
-	and l.nval_num >= 126 and lower(l.units_cd)='mg/dl'
-;
+select e.PATID, l.LAB_ORDER_DATE, row_number() over (partition by l.PATID order by l.LAB_ORDER_DATE asc) rn  
+  from lab_result_cm_i2b2 l 
+  join encounter_exclude_pregnancy e
+  on l.ENCOUNTERID=e.ENCOUNTERID
+  where l.RESULT_NUM >= 126 
+    and lower(l.RESULT_UNIT)='mg/dl'
+    and l.LAB_LOINC in (select loinc from nextd_lab_review where label = 'Fasting Glucose') 
+    and l.LAB_NAME in ('GLUF','RUGLUF')
+    and e.ENC_TYPE in ('IP', 'EI', 'AV', 'ED')
+    and (round(l.LAB_ORDER_DATE) - e.BIRTH_DATE)/365 <= 89
+    and (round(l.LAB_ORDER_DATE) - e.BIRTH_DATE)/365 >= 18
+; --0 rows inserted
 COMMIT;
 /*                     The first date out the first pair of encounters is selected:		*/
 insert into temp2
@@ -221,9 +363,10 @@ select uf.PATID, uf.LAB_ORDER_DATE,row_number() over (partition by un.PATID orde
   on un.PATID = uf.PATID
   where abs(un.LAB_ORDER_DATE-uf.LAB_ORDER_DATE)>1 
   and abs(cast(((cast(un.LAB_ORDER_DATE as date)-cast(uf.LAB_ORDER_DATE as date))/365.25 ) as integer))<=2;
+--- ERROR HERE 
 insert into FG_final_FirstPair             
 select x.PATID, x.LAB_ORDER_DATE as EventDate 
-  from temp1 x where x.rn=1; 
+  from temp2 x where x.rn=1; 
 COMMIT;
 /*---------------------------------------------------------------------------------------------------------------
 -----     People with random glucose having two measures on different days within 2 years interval        -----
@@ -244,14 +387,17 @@ COMMIT;
 ---------------------------------------------------------------------------------------------------------------
                            Get all labs for each patient sorted by date:            */
 insert into RG_initial
-select ds.PATID, l.start_date, row_number() over (partition by l.patient_num order by l.start_date asc) rn  
-  from DenominatorSummary ds
-  join glucose_results l 
-  on ds.PATID=l.patient_num
-  join encounter_of_interest e
-  on l.encounter_num=e.ENCOUNTERID
-  where l.fasting = 0
-	and l.nval_num >= 200 and lower(l.units_cd)='mg/dl'
+select e.PATID, l.LAB_ORDER_DATE, row_number() over (partition by l.PATID order by l.LAB_ORDER_DATE asc) rn  
+  from lab_result_cm_i2b2 l 
+  join encounter_exclude_pregnancy e
+  on l.ENCOUNTERID=e.ENCOUNTERID
+  where l.RESULT_NUM >= 200 
+    and lower(l.RESULT_UNIT)='mg/dl'
+    and l.LAB_LOINC in (select loinc from nextd_lab_review where label = 'Random Glucose') 
+    and l.LAB_NAME in ('GLUF','RUGLUF')
+    and e.ENC_TYPE in ('IP', 'EI', 'AV', 'ED')
+    and (round(l.LAB_ORDER_DATE) - e.BIRTH_DATE)/365 <= 89
+    and (round(l.LAB_ORDER_DATE) - e.BIRTH_DATE)/365 >= 18
 ;
 COMMIT;
 /*-- The first date out the first pair of encounters is selected:		*/
@@ -265,7 +411,7 @@ select uf.PATID, uf.LAB_ORDER_DATE, row_number() over (partition by un.PATID ord
 COMMIT;
 insert into RG_final_FirstPair
 select x.PATID, x.LAB_ORDER_DATE as EventDate 
-  from temp1 x where x.rn=1; 
+  from temp3 x where x.rn=1; 
 COMMIT;
 /*-------------------------------------------------------------------------------------------------------------
 -----     People with one random glucose & one HbA1c having both measures on different days within        -----
@@ -350,13 +496,14 @@ COMMIT;
 ---------------------------------------------------------------------------------------------------------------
                Get all visits of specified types for each patient sorted by date:  */
 insert into Visits_initial 
-select ds.PATID, l.ADMIT_DATE, row_number() over (partition by l.PATID order by l.ADMIT_DATE asc) rn  
-  from DenominatorSummary ds
-  join "&&PCORNET_CDM".DIAGNOSIS l 
-  on ds.PATID=l.PATID
-  join encounter_of_interest e
+select e.PATID, l.ADMIT_DATE, row_number() over (partition by l.PATID order by l.ADMIT_DATE asc) rn  
+  from "&&PCORNET_CDM".DIAGNOSIS l 
+  join encounter_exclude_pregnancy e
   on l.ENCOUNTERID=e.ENCOUNTERID 
   where ((REGEXP_LIKE (l.DX, '250\..[0|1|2|3]') and l.DX_TYPE = '09') or (REGEXP_LIKE (l.DX, 'E1[0|1]') and l.DX_TYPE = '10'))
+    and e.ENC_TYPE in ('IP', 'EI', 'AV', 'ED')
+    and (round(l.ADMIT_DATE) - e.BIRTH_DATE)/365 <= 89
+    and (round(l.ADMIT_DATE) - e.BIRTH_DATE)/365 >= 18
 ;
 COMMIT;
 /* Select the date for the first visit within the first pair: */
@@ -389,19 +536,13 @@ COMMIT;
 -------------------------------------------------------------------------------------------------------------*/
 
 create or replace view each_med_obs as
-with med_info_aux as (
-  select distinct dm_drug, drug, rxcui, pattern
-       /* combine but_not patterns using (pat1)|(pat2)|(pat3)... */
-       , listagg(but_not, ')|(') within group (order by dm_drug, drug, rxcui, pattern, but_not) but_not
+with
+med_info as (
+  select distinct dm_drug, drug, rxcui
   from nextd_med_info info
-  group by dm_drug, drug, rxcui, pattern
+  where rxcui is not null
 )
-, med_info as (
-  select dm_drug, drug, rxcui, pattern
-       , case when but_not is null then null else '(' || but_not || ')' end but_not
-  from med_info_aux
-)
-select /*+ leading(a) */ a.PATID, a.encounterid, round(a.RX_ORDER_DATE) as MedDate
+select  a.PATID, a.encounterid, round(a.RX_ORDER_DATE) as MedDate
     , med_info.dm_drug
     , med_info.drug
     , a.RAW_RX_MED_NAME
@@ -411,10 +552,6 @@ select /*+ leading(a) */ a.PATID, a.encounterid, round(a.RX_ORDER_DATE) as MedDa
   "&&PCORNET_CDM".PRESCRIBING a
   join med_info
      on to_char(med_info.rxcui) = a.RXNORM_CUI
-     or (
-     regexp_like(a.RAW_RX_MED_NAME, med_info.pattern, 'i')
-     and (med_info.but_not is null or
-          not regexp_like(a.RAW_RX_MED_NAME, med_info.but_not, 'i')))
 ;
 
 /* Performance note:
@@ -505,9 +642,9 @@ select x.PATID, x.MedDate
 COMMIT;
 insert into p5
 select x.PATID, x.MedDate
-from #InclusionUnderRestrictionMeds_initial x
-join #A1cFG_final_FirstPair y
-on x.PATID=y.PATID
+from InclUnderRestrMeds_init x
+join A1cFG_final_FirstPair y
+on x.PATID=y.PATID;
 COMMIT;
 /* Collect all non-specific to Diabetes Mellitus meds:  */
 insert into InclUnderRestrMeds_final
@@ -528,10 +665,11 @@ select y.PATID, y.MedDate as EventDate
   from p4 d
   union
   select e.PATID, e.MedDate
-  from p5 as e
-  union
-  select f.PATID, f.MedDate
-  from p6 as f
+  from p5 e
+  --p6 is not a table; is it supposed to be?
+  --union
+  --select f.PATID, f.MedDate
+  --from p6 f
   )x
   )y
   where y.rn=1;
@@ -574,117 +712,7 @@ select y.PATID, y.EventDate
 	) y
   where y.rn=1;
   COMMIT;
-/*-------------------------------------------------------------------------------------------------------------
----------------------------------------------------------------------------------------------------------------
------                                    Part 3: Defining Pregnancy                                       ----- 
----------------------------------------------------------------------------------------------------------------
----------------------------------------------------------------------------------------------------------------
------                             People with pregnancy-related encounters                                -----
------                                                                                                     -----            
------                       Encounter should meet the following requirements:                             -----
------           Patient must be 18 years old >= age <= 89 years old during the encounter day.             -----
------                                                                                                     -----
------                 The date of the first encounter for each pregnancy is collected.                    -----
----------------------------------------------------------------------------------------------------------------
- Cases with miscarriage or abortion diagnosis codes:*/
-insert into Miscarr_Abort
-select ds.PATID, dia.ADMIT_DATE 
-  from DenominatorSummary ds
-  join "&&PCORNET_CDM".DIAGNOSIS dia 
-  on ds.PATID=dia.PATID
-	join "&&PCORNET_CDM".ENCOUNTER e
-	on dia.ENCOUNTERID=e.ENCOUNTERID 
-	join "&&PCORNET_CDM".DEMOGRAPHIC d
-	on e.PATID=d.PATID
-		where ((regexp_like(dia.DX,'63[0|1|2|3|4|5|6|7|8|9]\..') and dia.DX_TYPE = '09') or (regexp_like(dia.DX, '^O') and dia.DX_TYPE = '10'))
-		and cast(((cast(dia.ADMIT_DATE as date)-cast(d.BIRTH_DATE as date))/365.25 ) as integer) <= 89 
-    and cast(((cast(dia.ADMIT_DATE as date)-cast(d.BIRTH_DATE as date))/365.25 ) as integer) >=18;
-COMMIT;
-/*-- Cases with pregnancy and birth diagnosis codes:*/
-insert into Pregn_Birth
-select ds.PATID,dia.ADMIT_DATE 
-  from DenominatorSummary ds
-  join "&&PCORNET_CDM".DIAGNOSIS dia 
-  on ds.PATID=dia.PATID
-	join "&&PCORNET_CDM".ENCOUNTER e
-	on dia.ENCOUNTERID=e.ENCOUNTERID 
-	join "&&PCORNET_CDM".DEMOGRAPHIC d
-	on e.PATID=d.PATID	
-	where (regexp_like(dia.DX,'6[4|5|6|7][0|1|2|3|4|5|6|7|8|9]\..') and dia.DX_TYPE = '09')
-  and cast(((cast(dia.ADMIT_DATE as date)-cast(d.BIRTH_DATE as date))/365.25 ) as integer) <= 89 
-  and cast(((cast(dia.ADMIT_DATE as date)-cast(d.BIRTH_DATE as date))/365.25 ) as integer) >=18;
-COMMIT;
-/* Cases with delivery procedures in ICD-9 coding:*/
-insert into DelivProc
-select ds.PATID, p.ADMIT_DATE 
-  from DenominatorSummary ds
-  join "&&PCORNET_CDM".PROCEDURES p 
-  on ds.PATID=p.PATID
-	join "&&PCORNET_CDM".ENCOUNTER e
-	on p.ENCOUNTERID=e.ENCOUNTERID 
-	join "&&PCORNET_CDM".DEMOGRAPHIC d
-	on e.PATID=d.PATID	
-		where ((regexp_like(p.PX,'7[2|3|4|5]\..') and p.PX_TYPE = '09') or (p.PX like '^1' and p.PX_TYPE = '10'))
-		and cast(((cast(p.ADMIT_DATE as date)-cast(d.BIRTH_DATE as date))/365.25 ) as integer) <= 89 
-    and cast(((cast(p.ADMIT_DATE as date)-cast(d.BIRTH_DATE as date))/365.25 ) as integer)>=18;
-COMMIT;
-/* Cases with delivery procedures in CPT coding:		*/
-insert into PregProc
-select ds.PATID, p.ADMIT_DATE 
-  from DenominatorSummary ds
-  join "&&PCORNET_CDM".PROCEDURES p 
-  on ds.PATID=p.PATID
-	join "&&PCORNET_CDM".ENCOUNTER e
-	on p.ENCOUNTERID=e.ENCOUNTERID 
-	join "&&PCORNET_CDM".DEMOGRAPHIC d
-	on e.PATID=d.PATID	
-	where (regexp_like(p.PX,'59[0|1|2|3|4|5|6|7|8|9][0|1|2|3|4|5|6|7|8|9][0|1|2|3|4|5|6|7|8|9]') and p.PX_TYPE in ('C3', 'C4', 'CH'))
-    /* Changed to include C4 (and CH for later updates) since it refers to the same thing as C3 according to the CDM 3.1 Specification */
-	and cast(((cast(p.ADMIT_DATE as date)-cast(d.BIRTH_DATE as date))/365.25 ) as integer) <= 89 
-  and cast(((cast(p.ADMIT_DATE as date)-cast(d.BIRTH_DATE as date))/365.25 ) as integer) >=18;
-COMMIT;
-/*---------------------------------------------------------------------------------------------------------------
- Collect all encounters related to pregnancy:  */
-insert into AllPregnancyWithAllDates
-select x.PATID,x.ADMIT_DATE 
-  from
-  (select a.PATID, a.ADMIT_DATE 
-  from Miscarr_Abort a
-  union
-  select b.PATID, b.ADMIT_DATE
-  from Pregn_Birth b
-  union
-  select c.PATID, c.ADMIT_DATE
-  from DelivProc c
-  union
-  select d.PATID, d.ADMIT_DATE
-  from PregProc d)x
-  group by x.PATID, x.ADMIT_DATE;
-COMMIT;
-/*---------------------------------------------------------------------------------------------------------------
--- Find separate pregnancy events:                                   
--- Calculate time difference between each pregnancy encounter, select the first encounter of each pregnancy event:  */
-insert into DeltasPregnancy
-select x2.PATID,x2.ADMIT_DATE,x2.dif 
-  from
-  (select x.PATID,x.ADMIT_DATE,DATEDIFF(m, Lag(x.ADMIT_DATE, 1,NULL) OVER(partition by x.PATID ORDER BY x.ADMIT_DATE), x.ADMIT_DATE) as dif
-  from AllPregnancyWithAllDates x)x2
-  where x2.dif is NULL or x2.dif>=12;
-COMMIT;
-/* Number pregnancies:  */
-insert into NumberPregnancy
-select x.PATID, x.ADMIT_DATE, row_number() over (partition by x.PATID order by x.ADMIT_DATE asc) rn 
-  from DeltasPregnancy x;
-COMMIT;
-/* Transponse pregnancy table into single row per patient. Currently allows 21 sepearate pregnacy events:  */
-insert into FinalPregnancy
-select * 
-  from
-  (select PATID, ADMIT_DATE, rn
-  from NumberPregnancy) 
-  pivot (max(ADMIT_DATE) for (rn) in (1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21)
-  ) order by PATID;     
-COMMIT;
+
 /*-------------------------------------------------------------------------------------------------------------
 ---------------------------------------------------------------------------------------------------------------
 -----                 Part4: Combine results from all parts of the code into final table:                 -----
@@ -699,14 +727,14 @@ p.PregnancyDate_16, p.PregnancyDate_17, p.PregnancyDate_18, p.PregnancyDate_19, 
 p.PregnancyDate_21
   from DenominatorSummary ds
   left join AllDM x
-  on a.PATID=x.PATID
+  on ds.PATID=x.PATID
   left join "&&PCORNET_CDM".DEATH d
-  on a.PATID=d.PATID
+  on ds.PATID=d.PATID
   left join FinalPregnancy p
-  on a.PATID=p.PATID;
+  on ds.PATID=p.PATID;
   COMMIT;
 /*-------------------------------------------------------------------------------------------------------------
------                               Table #FinalStatTable is Table 1                                      -----
+-----                               Table FinalStatTable is Table 1                                      -----
 -----                          will be used for post-processing analysis                                  ------
 -----                             
 -------------------------------------------------------------------------------------------------------------*/

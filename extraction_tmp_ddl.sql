@@ -51,6 +51,7 @@ truncate TABLE p1;
 truncate TABLE p2;
 truncate TABLE p3;
 truncate TABLE p4;
+truncate TABLE p5;
 truncate TABLE InclUnderRestrMeds_final;
 truncate TABLE AllDM;
 truncate TABLE Miscarr_Abort;
@@ -113,6 +114,7 @@ drop TABLE p1;
 drop TABLE p2;
 drop TABLE p3;
 drop TABLE p4;
+drop TABLE p5;
 drop TABLE InclUnderRestrMeds_final;
 drop TABLE AllDM;
 drop TABLE Miscarr_Abort;
@@ -161,7 +163,8 @@ CREATE GLOBAL TEMPORARY TABLE A1c_initial
   on commit preserve rows;
 CREATE GLOBAL TEMPORARY TABLE temp1
   (PATID VARCHAR(128) NOT NULL,
-  LAB_ORDER_DATE date NULL)
+  LAB_ORDER_DATE date NULL, 
+  RN INT )
   on commit preserve rows;
 CREATE GLOBAL TEMPORARY TABLE A1c_final_FirstPair
   (PATID VARCHAR(128) NOT NULL,
@@ -179,8 +182,7 @@ CREATE GLOBAL TEMPORARY TABLE temp2
   on commit preserve rows;
 CREATE GLOBAL TEMPORARY TABLE FG_final_FirstPair  
   (PATID VARCHAR(128) NOT NULL,
-  LAB_ORDER_DATE date NULL,
-  rn INT)
+  EventDate date NULL)
   on commit preserve rows;
 CREATE GLOBAL TEMPORARY TABLE RG_initial
   (PATID VARCHAR(128) NOT NULL,
@@ -342,13 +344,17 @@ CREATE GLOBAL TEMPORARY TABLE p4
   (PATID VARCHAR(128) NOT NULL,
   MedDate date NULL)
   on commit preserve rows;
+CREATE GLOBAL TEMPORARY TABLE p5
+  (PATID VARCHAR(128) NOT NULL,
+  MedDate date NULL)
+  on commit preserve rows;
 CREATE GLOBAL TEMPORARY TABLE InclUnderRestrMeds_final
   (PATID VARCHAR(128) NOT NULL,
   EventDate date NULL)
   on commit preserve rows;
 CREATE GLOBAL TEMPORARY TABLE AllDM
   (PATID VARCHAR(128) NOT NULL,
-  ADMIT_DATE date NULL)
+  EventDate date NULL)
   on commit preserve rows;
  CREATE GLOBAL TEMPORARY TABLE Miscarr_Abort
   (PATID VARCHAR(128) NOT NULL,
@@ -454,13 +460,9 @@ create table nextd_med_info (
 
 drop table nextd_lab_review;
 create table nextd_lab_review (
-   sheet         varchar2(32),
-   site          varchar2(32),
-   c_name        varchar2(128),
-   c_totalnum    integer,
-   c_basecode    varchar2(64),
-   category      varchar2(64),
-   constraint cat_list check (category is null or
-                              category in ('A1c', 'Fasting Glucose', 'Random Glucose'))
+   label              varchar2(64),
+   loinc              varchar2(32),
+   description        varchar2(128),
+   constraint cat_list check (label is null or
+                              label in ('HbA1c', 'Fasting Glucose', 'Random Glucose'))
 );
-
